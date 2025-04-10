@@ -28,7 +28,8 @@ dependencies = [
     "simwrapper > 1.7",
     "sparse",
     "tables >= 3.9",
-    "xarray >= 0.21"
+    "xarray >= 0.21",
+    "multimethod==1.9"
 ]
 readme = "README.md"
 requires-python = ">=3.10"
