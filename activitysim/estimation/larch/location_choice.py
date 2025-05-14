@@ -369,7 +369,7 @@ def location_choice_model(
 
     d_ca = Dataset.construct.from_idca(x_ca_1)
     d_co = Dataset.construct.from_idco(x_co)
-    d = d_ca.merge(d_co)
+    d = d_ca.merge(d_co, compat="override")
     if av is not None:
         d["_avail_"] = av
 
@@ -503,6 +503,13 @@ def workplace_location_model(**kwargs):
     unused = kwargs.pop("name", None)
     return location_choice_model(
         name="workplace_location",
+        **kwargs,
+    )
+
+def business_location_model(**kwargs):
+    unused = kwargs.pop("name", None)
+    return location_choice_model(
+        name="business_location",
         **kwargs,
     )
 
