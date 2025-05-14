@@ -404,7 +404,7 @@ def cdap_data(
             if "comment" in kwargs:
                 del kwargs["comment"]
             print(f"Reading {filename.with_suffix('.parquet')}")
-            return pd.read_parquet(filename.with_suffix(".parquet"), **kwargs)
+            return pd.read_parquet(filename.with_suffix(".parquet"), **kwargs).reset_index()
         print(f"Reading {filename}")
         return pd.read_csv(filename, **kwargs)
 
