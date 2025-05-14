@@ -947,7 +947,11 @@ def iterate_location_choice(
 
     persons_merged_df = persons_merged
 
-    persons_merged_df = persons_merged_df[persons_merged[chooser_filter_column]]
+    if estimator:
+        # this is to skip people without observed mandatory location for creating the estimation dataset
+        persons_merged_df = persons_merged_df[persons_merged[chooser_filter_column] & persons_merged[f"observed_{dest_choice_column_name}"]]
+    else: 
+        persons_merged_df = persons_merged_df[persons_merged[chooser_filter_column]]
 
     persons_merged_df.sort_index(
         inplace=True
