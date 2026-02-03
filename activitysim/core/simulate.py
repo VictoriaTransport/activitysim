@@ -1264,7 +1264,7 @@ def eval_mnl(
     choosers,
     spec,
     locals_d,
-    custom_chooser: CustomChooser_T,
+    custom_chooser: CustomChooser_T | None,
     estimator,
     log_alt_losers=False,
     want_logsums=False,
