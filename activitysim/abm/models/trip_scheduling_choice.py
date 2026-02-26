@@ -285,7 +285,6 @@ def run_trip_scheduling_choice(
             assert choosers[NUM_ALTERNATIVES].sum() == schedules.shape[0]
 
             # Run the simulation
-            z
             choices = _interaction_sample_simulate(
                 state,
                 choosers=choosers,
