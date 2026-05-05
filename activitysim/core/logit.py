@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import warnings
+from dataclasses import dataclass
+from typing import Union
 
 import numpy as np
 import pandas as pd
@@ -21,6 +23,11 @@ logger = logging.getLogger(__name__)
 
 EXP_UTIL_MIN = 1e-300
 EXP_UTIL_MAX = np.inf
+
+# TODO-EET: Figure out what type we want UTIL_MIN to be, currently np.float64
+UTIL_MIN = np.log(EXP_UTIL_MIN, dtype=np.float64)
+UTIL_UNAVAILABLE = 1000.0 * (UTIL_MIN - 1.0)
+
 
 PROB_MIN = 0.0
 PROB_MAX = 1.0
@@ -126,6 +133,70 @@ def utils_to_logsums(utils, exponentiated=False, allow_zero_probs=False):
     logsums = pd.Series(logsums, index=utils.index)
 
     return logsums
+
+
+def validate_utils(
+    state: workflow.State,
+    utils,
+    trace_label=None,
+    allow_zero_probs=False,
+    trace_choosers=None,
+):
+    """
+    Validate utilities to ensure non-available choices are treated the same in EET and MC.
+    For EET decisions, no conversion to probabilities is required because choices
+    are made on the basis of comparing utilities (only differences matter).
+    However, large negative utility values are used in practice to make choices
+    unavailable based on probability calculations, which boils down to evaluating
+    exp(utility). We here use this to define a minimum utility that corresponds
+    to an unavailable choice.
+
+    Parameters
+    ----------
+    utils : pandas.DataFrame
+        Rows should be choosers and columns should be alternatives.
+
+    trace_label : str, optional
+        label for tracing bad utility or probability values
+
+    allow_zero_probs : bool
+        if True value rows in which all utility alts are UTIL_MIN will be set to
+        UTIL_UNAVAILABLE.
+
+    trace_choosers : pandas.dataframe
+        the choosers df (for interaction_simulate) to facilitate the reporting of hh_id
+        by report_bad_choices because it can't deduce hh_id from the interaction_dataset
+        which is indexed on index values from alternatives df
+
+    Returns
+    -------
+    utils : pandas.DataFrame
+        utils with values that would lead to zero probability replaced by UTIL_UNAVAILABLE
+
+    """
+    trace_label = tracing.extend_trace_label(trace_label, "validate_utils")
+
+    utils_arr = utils.values
+
+    np.putmask(utils_arr, utils_arr <= UTIL_MIN, UTIL_UNAVAILABLE)
+
+    arr_sum = utils_arr.sum(axis=1)
+
+    if not allow_zero_probs:
+        zero_probs = arr_sum <= utils_arr.shape[1] * UTIL_UNAVAILABLE
+        if zero_probs.any():
+            report_bad_choices(
+                state,
+                zero_probs,
+                utils,
+                trace_label=tracing.extend_trace_label(trace_label, "zero_prob_utils"),
+                msg="all probabilities are zero",
+                trace_choosers=trace_choosers,
+            )
+
+    utils = pd.DataFrame(utils_arr, columns=utils.columns, index=utils.index)
+
+    return utils
 
 
 def utils_to_probs(
@@ -274,6 +345,171 @@ def utils_to_probs(
         return probs, logsums
     return probs
 
+FREEZE_RANDOM_NUMBERS_FOR_DENSE_ALTERNATIVE_SET = True
+
+@dataclass
+class AltsContext:
+    """Representation of the alternatives without carrying around that full array."""
+    min_alt_id: int
+    max_alt_id: int
+
+    def __post_init__(self):
+        # e.g. for zero based zones max_alt_id = n_alts - 1
+        # but for 1 based zones, we don't need to add extra padding
+        self.n_rands_to_sample = max(self.max_alt_id, self.n_alts_to_cover_max_id)
+
+    @classmethod
+    def from_series(cls, ser:Union[pd.Series,pd.Index])->"AltsContext":
+        min_alt_id = ser.min()
+        max_alt_id = ser.max()
+        return cls(min_alt_id, max_alt_id)
+
+    @classmethod
+    def from_num_alts(cls, num_alts:int, zero_based:bool=True)->"AltsContext":
+        if zero_based:
+            offset = -1
+        else:
+            offset =0
+        return cls(min_alt_id=1+offset, max_alt_id=num_alts+offset )
+
+
+    @property
+    def n_alts_to_cover_max_id(self) -> int:
+        """If zones were non-consecutive, this could be a big over-estimate."""
+        return self.max_alt_id+1
+
+
+# TODO-EET: add doc string, tracing
+def add_ev1_random(state: workflow.State, df: pd.DataFrame, alt_info: AltsContext | None = None,
+                   alt_nrs_df: pd.DataFrame | None = None, ):
+
+    nest_utils_for_choice = df.copy()
+    assert (alt_info is None) == (
+            alt_nrs_df is None), "n_zones and alt_nrs_df must both be provided or omitted together"
+
+    if alt_nrs_df is not None and FREEZE_RANDOM_NUMBERS_FOR_DENSE_ALTERNATIVE_SET:
+        assert alt_info is not None # narrowing for mypy
+
+        idx_array = alt_nrs_df.values
+        mask = idx_array == -999
+        safe_idx = np.where(mask, 1, idx_array)  # replace -999 with a temp value inbounds
+        # generate random number for all alts - this is wasteful, but ensures that the same zone
+        #  gets the same random number if the sampled choice set changes between base and project
+        # (alternatively, one could seed a channel for (persons x zones) and use the zone seed to ensure consistency.
+        # Trade off is needing to seed (persons x zones) rows and multiindex channels to
+        # avoid extra random numbers generated here. Quick benchmark suggests seeding per row is likely slower
+        rands_dense = state.get_rn_generator().gumbel_for_df(nest_utils_for_choice, n=alt_info.n_alts_to_cover_max_id)
+        # generate n=alt_info.max_alt_id+1 rather than n_alts so that indexing works
+        # (this is drawing a random number for a redundant zeroth zone in 1 based zoning systems)
+        # TODO deal with non 0->n-1 indexed land use more efficiently? ideally do where alt_nrs_df is constructed,
+        #  not on the fly here. Potentially via state.get_injectable('network_los').get_skim_dict('taz').zone_ids
+        rands = np.take_along_axis(rands_dense, safe_idx, axis=1)
+        rands[mask] = 0 # zero out the masked zones so they don't have the util adjustment of alt 0
+    else:
+        # old behaviour, to remove
+        rands = state.get_rn_generator().gumbel_for_df(nest_utils_for_choice, n=nest_utils_for_choice.shape[1])
+
+    nest_utils_for_choice += rands
+    return nest_utils_for_choice
+
+
+def choose_from_tree(
+    nest_utils, all_alternatives, logit_nest_groups, nest_alternatives_by_name
+):
+    for level, nest_names in logit_nest_groups.items():
+        if level == 1:
+            next_level_alts = nest_alternatives_by_name[nest_names[0]]
+            continue
+        choice_this_level = nest_utils[nest_utils.index.isin(next_level_alts)].idxmax()
+        if choice_this_level in all_alternatives:
+            return choice_this_level
+        next_level_alts = nest_alternatives_by_name[choice_this_level]
+    raise ValueError("This should never happen - no alternative found")
+
+
+# TODO-EET: add doc string, tracing
+def make_choices_explicit_error_term_nl(
+    state, nested_utilities, alt_order_array, nest_spec, trace_label
+):
+    """walk down the nesting tree and make choice at each level, which is the root of the next level choice."""
+    nest_utils_for_choice = add_ev1_random(state, nested_utilities)
+
+    all_alternatives = set(nest.name for nest in each_nest(nest_spec, type="leaf"))
+    logit_nest_groups = group_nest_names_by_level(nest_spec)
+    nest_alternatives_by_name = {n.name: n.alternatives for n in each_nest(nest_spec)}
+
+    # Apply is slow. It could *maybe* be sped up by using the fact that the nesting structure is the same for all rows:
+    # Add ev1(0,1) to all entries (as is currently being done). Then, at each level, pick the maximum of the available
+    # composite alternatives and set the corresponding entry to 1 for each row, set all other alternatives at this level
+    # to zero. Once the tree is walked (all alternatives have been processed), take the product of the alternatives in
+    # each leaf's alternative list. Then pick the only alternative with entry 1, all others must be 0.
+    choices = nest_utils_for_choice.apply(
+        lambda x: choose_from_tree(
+            x, all_alternatives, logit_nest_groups, nest_alternatives_by_name
+        ),
+        axis=1,
+    )
+    # TODO-EET: reporting like for zero probs
+    assert not choices.isnull().any(), f"No choice for {trace_label}"
+    choices = pd.Series(choices, index=nest_utils_for_choice.index)
+
+    # In order for choice indexing to be consistent with MNL and cumsum MC choices, we need to index in the order
+    #  alternatives were originally created before adding nest nodes that are not elemental alternatives
+    choices = choices.map({v: k for k, v in enumerate(alt_order_array)})
+
+    return choices
+
+
+# TODO-EET: add doc string, tracing
+def make_choices_explicit_error_term_mnl(state, utilities, trace_label,
+                                         alts_context: AltsContext | None = None,
+                                         alt_nrs_df: pd.DataFrame | None = None,
+                                         ):
+    utilities_incl_unobs = add_ev1_random(state, utilities, alts_context, alt_nrs_df)
+    choices = np.argmax(utilities_incl_unobs.to_numpy(), axis=1)
+    # TODO-EET: reporting like for zero probs
+    assert not np.isnan(choices).any(), f"No choice for {trace_label}"
+    choices = pd.Series(choices, index=utilities_incl_unobs.index)
+    return choices
+
+
+def make_choices_explicit_error_term(
+    state, utilities, alt_order_array, nest_spec=None, trace_label=None,
+        alts_context: AltsContext | None = None,
+        alt_nrs_df: pd.DataFrame | None = None,
+):
+    trace_label = tracing.extend_trace_label(trace_label, "make_choices_eet")
+    if nest_spec is None:
+        choices = make_choices_explicit_error_term_mnl(state, utilities, trace_label, alts_context, alt_nrs_df)
+    else:
+        choices = make_choices_explicit_error_term_nl(
+            state, utilities, alt_order_array, nest_spec, trace_label
+        )
+    return choices
+
+
+def make_choices_utility_based(
+    state: workflow.State,
+    utilities: pd.DataFrame,
+    name_mapping=None,
+    nest_spec=None,
+    trace_label: str | None = None,
+    trace_choosers=None,
+    allow_bad_probs=False,
+    alts_context: AltsContext | None = None,
+    alt_nrs_df: pd.DataFrame | None = None,
+) -> tuple[pd.Series, pd.Series]:
+    trace_label = tracing.extend_trace_label(trace_label, "make_choices_utility_based")
+
+    # TODO-EET: index of choices for nested utilities is different than unnested - this needs to be consistent for
+    #  turning indexes into alternative names to keep code changes to minimum for now
+    choices = make_choices_explicit_error_term(
+        state, utilities, name_mapping, nest_spec, trace_label, alts_context, alt_nrs_df
+    )
+    # TODO-EET: rands - log all zeros for now
+    rands = pd.Series(np.zeros_like(utilities.index.values), index=utilities.index)
+    return choices, rands
+
 
 def make_choices(
     state: workflow.State,
@@ -284,28 +520,23 @@ def make_choices(
 ) -> tuple[pd.Series, pd.Series]:
     """
     Make choices for each chooser from among a set of alternatives.
-
     Parameters
     ----------
     probs : pandas.DataFrame
         Rows for choosers and columns for the alternatives from which they
         are choosing. Values are expected to be valid probabilities across
         each row, e.g. they should sum to 1.
-
     trace_choosers : pandas.dataframe
         the choosers df (for interaction_simulate) to facilitate the reporting of hh_id
         by report_bad_choices because it can't deduce hh_id from the interaction_dataset
         which is indexed on index values from alternatives df
-
     Returns
     -------
     choices : pandas.Series
         Maps chooser IDs (from `probs` index) to a choice, where the choice
         is an index into the columns of `probs`.
-
     rands : pandas.Series
         The random numbers used to make the choices (for debugging, tracing)
-
     """
     trace_label = tracing.extend_trace_label(trace_label, "make_choices")
 
@@ -546,6 +777,7 @@ def _each_nest(spec: LogitNestSpec, parent_nest, post_order):
         nest.level = parent_nest.level + 1
         nest.product_of_coefficients = parent_nest.product_of_coefficients
         nest.ancestors = parent_nest.ancestors + [name]
+        nest.coefficient = parent_nest.coefficient
 
         yield spec, nest
 
@@ -602,3 +834,12 @@ def count_nests(nest_spec):
             return 1
 
     return count_each_nest(nest_spec, 0) if nest_spec is not None else 0
+
+
+def group_nest_names_by_level(nest_spec):
+    # group nests by level, returns {level: [nest.name at that level]}
+    depth = np.max([x.level for x in each_nest(nest_spec)])
+    nest_levels = {x: [] for x in range(1, depth + 1)}
+    for n in each_nest(nest_spec):
+        nest_levels[n.level].append(n.name)
+    return nest_levels
