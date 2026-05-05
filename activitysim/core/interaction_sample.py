@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 import logging
+import typing
 
 import numpy as np
 import pandas as pd
-
 from activitysim.core import (
     chunk,
     estimation,
@@ -17,14 +17,141 @@ from activitysim.core import (
     util,
     workflow,
 )
+from activitysim.core.chunk import ChunkSizer
 from activitysim.core.configuration.base import ComputeSettings
+from activitysim.core.exceptions import SegmentedSpecificationError
 from activitysim.core.skim_dataset import DatasetWrapper
 from activitysim.core.skim_dictionary import SkimWrapper
-from activitysim.core.exceptions import SegmentedSpecificationError
+if typing.TYPE_CHECKING:
+    from activitysim.core.random import Random
 
 logger = logging.getLogger(__name__)
 
 DUMP = False
+
+
+def _poisson_sample_alternatives_inner(
+    alternative_count: int,
+    probs: pd.DataFrame,
+    poisson_inclusion_probs: pd.DataFrame,
+    rng: Random,
+    trace_label: str | None,
+    chunk_sizer:ChunkSizer,
+) -> pd.DataFrame:
+    rands = rng.random_for_df(probs, n=alternative_count)
+    chunk_sizer.log_df(trace_label, "rands", rands)
+    sampled_mask = rands < poisson_inclusion_probs
+    sampled_results = poisson_inclusion_probs.where(sampled_mask)
+    return sampled_results
+
+
+def make_sample_choices_utility_based(
+    state: workflow.State,
+    choosers,
+    utilities,
+    alternatives,
+    sample_size,
+    alternative_count,
+    alt_col_name,
+    allow_zero_probs,
+    trace_label:str,
+    chunk_sizer:ChunkSizer,
+):
+    assert isinstance(utilities, pd.DataFrame)
+    assert utilities.shape == (len(choosers), alternative_count)
+
+    assert isinstance(alternatives, pd.DataFrame)
+    assert len(alternatives) == alternative_count
+
+    if allow_zero_probs:
+        zero_probs = (
+            utilities.sum(axis=1) <= utilities.shape[1] * logit.UTIL_UNAVAILABLE
+        )
+        if zero_probs.all():
+            utils = pd.DataFrame(
+                columns=[alt_col_name, "rand", "prob", choosers.index.name]
+            )
+            probs = pd.DataFrame(0.0, index=utils.index, columns=utils.columns)
+            return utils, probs
+        if zero_probs.any():
+            # remove from sample
+            utilities = utilities[~zero_probs]
+            choosers = choosers[~zero_probs]
+
+    utils_array = utilities.to_numpy()
+    chunk_sizer.log_df(trace_label, "utils_array", utils_array)
+
+    probs = logit.utils_to_probs(
+        state,
+        utilities,
+        allow_zero_probs=allow_zero_probs,
+        trace_label=trace_label,
+        overflow_protection=not allow_zero_probs,
+        trace_choosers=choosers,
+    )
+    inclusion_probs, sampled_alternatives = _poisson_sample_alternatives(alternative_count, chunk_sizer, probs,
+                                                                         sample_size, state, trace_label)
+
+    # Stack removes the NaNs (the ones that weren't sampled)
+    # and gives us a multi-index of (person_id, alt_id)
+    choices_df = (
+        sampled_alternatives.rename_axis("alt_idx", axis=1)
+        .stack()
+        .reset_index(name="prob")
+        .assign(**{alt_col_name: lambda df: alternatives.index.values[df["alt_idx"]]})
+        .drop(columns=["alt_idx"])
+    )
+
+    # Here we return the inclusion probabilities i.e. the true probability of being sampled and (ab)use the fact
+    # that pick_count=1 by definition and ln(1)=0 and recover the standard sample correction term.
+    # In non-Poisson sampling, we would return the probs of sampling an alternative once
+    # and the sampling correction factor np.log(df.pick_count/df.prob) is applied to the simulate utilities.
+    # TODO is it safe change the meaning of df.prob, given it's referenced in expression csvs?
+    #   (but the alternative is to update all the expression CSV for sampling?)
+    return choices_df, inclusion_probs
+
+
+def _poisson_sample_alternatives(alternative_count, chunk_sizer: ChunkSizer, probs: pd.DataFrame, sample_size,
+                                 state: workflow.State, trace_label: str) -> tuple[pd.DataFrame, pd.DataFrame]:
+    # compute the inclusion probability as the reciprocal of alt never being drawn
+    #  -- these are common, so compute once upfront
+    exclusion_probs = (1 - probs) ** sample_size
+    inclusion_probs = 1 - exclusion_probs
+
+    n = 0
+    probs_subset = probs
+    inclusion_probs_subset = inclusion_probs
+    sampled_alternatives = pd.DataFrame(0.0, index=inclusion_probs.index, columns=inclusion_probs.columns)
+    while True:
+        sampled_results_subset = _poisson_sample_alternatives_inner(
+            alternative_count, probs_subset, inclusion_probs_subset, state.get_rn_generator(), trace_label, chunk_sizer
+        )
+        no_alts_sampled_mask = sampled_results_subset.isna().all(axis=1)
+        alts_with_sampled_alternatives = sampled_results_subset[~no_alts_sampled_mask]
+        sampled_alternatives.loc[alts_with_sampled_alternatives.index, :] = alts_with_sampled_alternatives
+        if no_alts_sampled_mask.any():
+            # TODO if this happens in base but the project case is such that something is picked, random numbers won't
+            #  be consistent - we're asserting that this is very rare models where the sample size is not too small
+            logger.info(f"Poisson sampling of alternatives failed with {n=}, retrying")
+            # TODO put this behind a debug guard, because it will be slow
+            logger.info(
+                f"Sampled size was {sample_size}, poisson method mean expected sample size was {inclusion_probs.sum(axis=1).mean():.1f}, actual sampled mean was {(sampled_alternatives > 0).sum(axis=1).mean():.1f} and highest zero selection prob was {(exclusion_probs).product(axis=1).max():.2g}")
+            probs_subset = probs[no_alts_sampled_mask]
+            inclusion_probs_subset = inclusion_probs[no_alts_sampled_mask]
+
+        else:  # All alternatives are fine
+            break
+
+        n += 1
+        if n == 10:
+            choosers_no_alts_sampled = sampled_results_subset[no_alts_sampled_mask]
+            msg = (f"Poisson choice set sampling failed after 10 attempts for these cases:\n"
+                   f"{choosers_no_alts_sampled}\n{probs_subset}")
+            raise ValueError(msg)
+
+    chunk_sizer.log_df(trace_label, "sampled_alternatives", sampled_alternatives)
+
+    return inclusion_probs, sampled_alternatives
 
 
 def make_sample_choices(
@@ -135,7 +262,7 @@ def _interaction_sample(
     locals_d=None,
     trace_label=None,
     zone_layer=None,
-    chunk_sizer=None,
+    chunk_sizer: ChunkSizer|None=None,
     compute_settings: ComputeSettings | None = None,
 ):
     """
@@ -191,15 +318,18 @@ def _interaction_sample(
     choices_df : pandas.DataFrame
 
         A DataFrame where index should match the index of the choosers DataFrame
-        and columns alt_col_name, prob, rand, pick_count
+        and columns alt_col_name, prob, pick_count
 
+        alt_col_name: int
+            the identifier of the alternatives
         prob: float
             the probability of the chosen alternative
-        rand: float
-            the rand that did the choosing
         pick_count : int
             number of duplicate picks for chooser, alt
     """
+    assert chunk_sizer is not None, "chunk_sizer cannot be None but old nullable signature is preserved"
+    # TODO it's probably safe to reorder these arguments to make chunk_sizer mandatory since
+    #   _interaction_sample is private?
 
     have_trace_targets = state.tracing.has_trace_targets(choosers)
     trace_ids = None
@@ -443,50 +573,105 @@ def _interaction_sample(
 
     state.tracing.dump_df(DUMP, utilities, trace_label, "utilities")
 
-    # convert to probabilities (utilities exponentiated and normalized to probs)
-    # probs is same shape as utilities, one row per chooser and one column for alternative
-    probs = logit.utils_to_probs(
-        state,
-        utilities,
-        allow_zero_probs=allow_zero_probs,
-        trace_label=trace_label,
-        trace_choosers=choosers,
-        overflow_protection=not allow_zero_probs,
-    )
-    chunk_sizer.log_df(trace_label, "probs", probs)
-
-    del utilities
-    chunk_sizer.log_df(trace_label, "utilities", None)
-
-    if have_trace_targets:
-        state.tracing.trace_df(
-            probs,
-            tracing.extend_trace_label(trace_label, "probs"),
-            column_labels=["alternative", "probability"],
+    if compute_settings.use_explicit_error_terms is not None:
+        use_eet = compute_settings.use_explicit_error_terms
+        logger.info(
+            f"Interaction sample model-specific EET overrides for {trace_label}: eet = {use_eet}"
         )
+    else:
+        use_eet = state.settings.use_explicit_error_terms
 
     if sample_size == 0:
-        # FIXME return full alternative set rather than sample
-        logger.info(
-            "Estimation mode for %s using unsampled alternatives" % (trace_label,)
-        )
+        # Return full alternative set rather than sample
+        logger.info("Using unsampled alternatives for %s" % (trace_label,))
 
-        index_name = probs.index.name
+        index_name = utilities.index.name
         choices_df = (
-            pd.melt(probs.reset_index(), id_vars=[index_name])
+            pd.melt(
+                utilities.reset_index(),
+                id_vars=[index_name],
+                value_name="prob",
+                var_name=alt_col_name,
+            )
             .sort_values(by=index_name, kind="mergesort")
             .set_index(index_name)
-            .rename(columns={"value": "prob"})
-            .drop(columns="variable")
+            .assign(prob=1)
+            .assign(pick_count=1)
         )
+        chunk_sizer.log_df(trace_label, "choices_df", choices_df)
 
-        choices_df["pick_count"] = 1
-        choices_df.insert(
-            0, alt_col_name, np.tile(alternatives.index.values, len(choosers.index))
-        )
+        # utilities are numbered 0..n-1 so we need to map back to alt ids
+        alternative_map = pd.Series(alternatives.index).to_dict()
+        choices_df[alt_col_name] = choices_df[alt_col_name].map(alternative_map)
+
+        del utilities
+        chunk_sizer.log_df(trace_label, "utilities", None)
 
         return choices_df
+
+    if use_eet:
+        utilities = logit.validate_utils(
+            state,
+            utilities,
+            allow_zero_probs=allow_zero_probs,
+            trace_label=trace_label,
+            trace_choosers=choosers,
+        )
+
+        choices_df, probs = make_sample_choices_utility_based(
+            state,
+            choosers,
+            utilities,
+            alternatives,
+            sample_size,
+            alternative_count,
+            alt_col_name,
+            allow_zero_probs=allow_zero_probs,
+            trace_label=trace_label,
+            chunk_sizer=chunk_sizer,
+        )
+
+        del utilities
+        chunk_sizer.log_df(trace_label, "utilities", None)
+
+        if estimation.manager.enabled and sample_size > 0:
+
+            choices_df = _ensure_chosen_alts_in_sample(
+                alt_col_name,
+                alternatives,
+                choices_df,
+                choosers,
+                probs,
+                state,
+                trace_label,
+            )
+
+        del probs
+        chunk_sizer.log_df(trace_label, "probs", None)
+
     else:
+        # convert to probabilities (utilities exponentiated and normalized to probs)
+        # probs is same shape as utilities, one row per chooser and one column for alternative
+        probs = logit.utils_to_probs(
+            state,
+            utilities,
+            allow_zero_probs=allow_zero_probs,
+            trace_label=trace_label,
+            trace_choosers=choosers,
+            overflow_protection=not allow_zero_probs,
+        )
+        chunk_sizer.log_df(trace_label, "probs", probs)
+
+        del utilities
+        chunk_sizer.log_df(trace_label, "utilities", None)
+
+        if have_trace_targets:
+            state.tracing.trace_df(
+                probs,
+                tracing.extend_trace_label(trace_label, "probs"),
+                column_labels=["alternative", "probability"],
+            )
+
         choices_df = make_sample_choices(
             state,
             choosers,
@@ -500,45 +685,23 @@ def _interaction_sample(
             chunk_sizer=chunk_sizer,
         )
 
+        chunk_sizer.log_df(trace_label, "choices_df", choices_df)
+
+        if estimation.manager.enabled and sample_size > 0:
+            choices_df = _ensure_chosen_alts_in_sample(
+                alt_col_name,
+                alternatives,
+                choices_df,
+                choosers,
+                probs,
+                state,
+                trace_label,
+            )
+
+        del probs
+        chunk_sizer.log_df(trace_label, "probs", None)
+
     chunk_sizer.log_df(trace_label, "choices_df", choices_df)
-
-    if estimation.manager.enabled and sample_size > 0:
-        # we need to ensure chosen alternative is included in the sample
-        survey_choices = estimation.manager.get_survey_destination_choices(
-            state, choosers, trace_label
-        )
-        if survey_choices is not None:
-            assert (
-                survey_choices.index == choosers.index
-            ).all(), "survey_choices and choosers must have the same index"
-            survey_choices.name = alt_col_name
-            survey_choices = survey_choices.dropna().astype(
-                choices_df[alt_col_name].dtype
-            )
-
-            # merge all survey choices onto choices_df
-            probs_df = probs.reset_index().melt(
-                id_vars=[choosers.index.name],
-                var_name=alt_col_name,
-                value_name="prob",
-            )
-            # probs are numbered 0..n-1 so we need to map back to alt ids
-            zone_map = pd.Series(alternatives.index).to_dict()
-            probs_df[alt_col_name] = probs_df[alt_col_name].map(zone_map)
-
-            survey_choices = pd.merge(
-                survey_choices,
-                probs_df,
-                on=[choosers.index.name, alt_col_name],
-                how="left",
-            )
-            survey_choices["rand"] = 0
-            survey_choices["prob"].fillna(0, inplace=True)
-            choices_df = pd.concat([choices_df, survey_choices], ignore_index=True)
-            choices_df.sort_values(by=[choosers.index.name], inplace=True)
-
-    del probs
-    chunk_sizer.log_df(trace_label, "probs", None)
 
     # pick_count and pick_dup
     # pick_count is number of duplicate picks
@@ -570,8 +733,10 @@ def _interaction_sample(
             column_labels=["sample_alt", "alternative"],
         )
 
-    # don't need this after tracing
-    del choices_df["rand"]
+    if not state.settings.use_explicit_error_terms:
+        # don't need this after tracing
+        del choices_df["rand"]
+
     chunk_sizer.log_df(trace_label, "choices_df", choices_df)
 
     # - NARROW
@@ -579,6 +744,49 @@ def _interaction_sample(
     assert (choices_df["pick_count"].max() < 4294967295) or (choices_df.empty)
     choices_df["pick_count"] = choices_df["pick_count"].astype(np.uint32)
 
+    return choices_df
+
+
+def _ensure_chosen_alts_in_sample(
+    alt_col_name,
+    alternatives: pd.DataFrame,
+    choices_df: pd.DataFrame,
+    choosers: pd.DataFrame,
+    probs: pd.DataFrame,
+    state: workflow.State,
+    trace_label:str,
+) -> pd.DataFrame:
+    # we need to ensure chosen alternative is included in the sample
+    survey_choices = estimation.manager.get_survey_destination_choices(
+        state, choosers, trace_label
+    )
+    if survey_choices is not None:
+        assert (
+            survey_choices.index == choosers.index
+        ).all(), "survey_choices and choosers must have the same index"
+        survey_choices.name = alt_col_name
+        survey_choices = survey_choices.dropna().astype(choices_df[alt_col_name].dtype)
+
+        # merge all survey choices onto choices_df
+        probs_df = probs.reset_index().melt(
+            id_vars=[choosers.index.name],
+            var_name=alt_col_name,
+            value_name="prob",
+        )
+        # probs are numbered 0..n-1 so we need to map back to alt ids
+        zone_map = pd.Series(alternatives.index).to_dict()
+        probs_df[alt_col_name] = probs_df[alt_col_name].map(zone_map)
+
+        survey_choices = pd.merge(
+            survey_choices,
+            probs_df,
+            on=[choosers.index.name, alt_col_name],
+            how="left",
+        )
+        survey_choices["rand"] = 0
+        survey_choices["prob"].fillna(0, inplace=True)
+        choices_df = pd.concat([choices_df, survey_choices], ignore_index=True)
+        choices_df.sort_values(by=[choosers.index.name], inplace=True)
     return choices_df
 
 
@@ -674,7 +882,14 @@ def interaction_sample(
         assert choosers.index.is_monotonic_increasing
 
     # FIXME - legacy logic - not sure this is needed or even correct?
-    sample_size = min(sample_size, len(alternatives.index))
+    if not state.settings.use_explicit_error_terms:
+        sample_size = min(sample_size, len(alternatives.index))
+        # with poisson sampling, definitely don't want to reduce sample size - it's not a sample size but a number
+        # of theoretical draws. Another options would be to disable sampling if # alts < sample size to ensure
+        # all are included (but this wouldn't behave well if there were land use changes in the project case which
+        # switched regimes)
+
+    logger.info(f" --- interaction_sample sample size = {sample_size}")
 
     result_list = []
     for (
