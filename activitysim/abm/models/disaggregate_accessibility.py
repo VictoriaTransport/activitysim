@@ -16,9 +16,9 @@ from activitysim.abm.models.util import tour_destination
 from activitysim.abm.tables import shadow_pricing
 from activitysim.core import estimation, los, tracing, util, workflow
 from activitysim.core.configuration.base import (
-    ComputeSettings,
     PreprocessorSettings,
     PydanticReadable,
+    ComputeSettings,
 )
 from activitysim.core.configuration.logit import TourLocationComponentSettings
 from activitysim.core.expressions import assign_columns

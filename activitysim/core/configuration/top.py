@@ -775,6 +775,17 @@ class Settings(PydanticBase, extra="allow", validate_assignment=True):
     .. versionadded:: 1.3
     """
 
+    use_explicit_error_terms: bool = False
+    """
+    Make choice from random utility model by drawing from distribution of unobserved
+    part of utility and taking the maximum of total utility.
+    
+    Defaults to standard Monte Carlo method, i.e., calculating probabilities and then
+    drawing a single uniform random number to draw from cumulative probabily.
+
+    .. versionadded:: 1.6
+    """
+
     check_model_settings: bool = True
     """
     run checks to validate that YAML settings files are loadable and spec and coefficent csv can be resolved.

@@ -54,8 +54,8 @@ def make_sample_choices_utility_based(
     alternative_count,
     alt_col_name,
     allow_zero_probs,
-    trace_label:str,
-    chunk_sizer:ChunkSizer,
+    trace_label: str,
+    chunk_sizer: ChunkSizer,
 ):
     assert isinstance(utilities, pd.DataFrame)
     assert utilities.shape == (len(choosers), alternative_count)
@@ -68,11 +68,9 @@ def make_sample_choices_utility_based(
             utilities.sum(axis=1) <= utilities.shape[1] * logit.UTIL_UNAVAILABLE
         )
         if zero_probs.all():
-            utils = pd.DataFrame(
+            return pd.DataFrame(
                 columns=[alt_col_name, "rand", "prob", choosers.index.name]
             )
-            probs = pd.DataFrame(0.0, index=utils.index, columns=utils.columns)
-            return utils, probs
         if zero_probs.any():
             # remove from sample
             utilities = utilities[~zero_probs]
@@ -108,7 +106,7 @@ def make_sample_choices_utility_based(
     # and the sampling correction factor np.log(df.pick_count/df.prob) is applied to the simulate utilities.
     # TODO is it safe change the meaning of df.prob, given it's referenced in expression csvs?
     #   (but the alternative is to update all the expression CSV for sampling?)
-    return choices_df, inclusion_probs
+    return choices_df
 
 
 def _poisson_sample_alternatives(alternative_count, chunk_sizer: ChunkSizer, probs: pd.DataFrame, sample_size,
@@ -610,6 +608,12 @@ def _interaction_sample(
         return choices_df
 
     if use_eet:
+
+        if estimation.manager.enabled:
+            raise ValueError(
+                "cannot use explicit error terms with estimation mode at this time"
+            )
+
         utilities = logit.validate_utils(
             state,
             utilities,
@@ -618,7 +622,7 @@ def _interaction_sample(
             trace_choosers=choosers,
         )
 
-        choices_df, probs = make_sample_choices_utility_based(
+        choices_df = make_sample_choices_utility_based(
             state,
             choosers,
             utilities,
@@ -630,25 +634,8 @@ def _interaction_sample(
             trace_label=trace_label,
             chunk_sizer=chunk_sizer,
         )
-
         del utilities
         chunk_sizer.log_df(trace_label, "utilities", None)
-
-        if estimation.manager.enabled and sample_size > 0:
-
-            choices_df = _ensure_chosen_alts_in_sample(
-                alt_col_name,
-                alternatives,
-                choices_df,
-                choosers,
-                probs,
-                state,
-                trace_label,
-            )
-
-        del probs
-        chunk_sizer.log_df(trace_label, "probs", None)
-
     else:
         # convert to probabilities (utilities exponentiated and normalized to probs)
         # probs is same shape as utilities, one row per chooser and one column for alternative
@@ -688,15 +675,39 @@ def _interaction_sample(
         chunk_sizer.log_df(trace_label, "choices_df", choices_df)
 
         if estimation.manager.enabled and sample_size > 0:
-            choices_df = _ensure_chosen_alts_in_sample(
-                alt_col_name,
-                alternatives,
-                choices_df,
-                choosers,
-                probs,
-                state,
-                trace_label,
+            # we need to ensure chosen alternative is included in the sample
+            survey_choices = estimation.manager.get_survey_destination_choices(
+                state, choosers, trace_label
             )
+            if survey_choices is not None:
+                assert (
+                    survey_choices.index == choosers.index
+                ).all(), "survey_choices and choosers must have the same index"
+                survey_choices.name = alt_col_name
+                survey_choices = survey_choices.dropna().astype(
+                    choices_df[alt_col_name].dtype
+                )
+
+                # merge all survey choices onto choices_df
+                probs_df = probs.reset_index().melt(
+                    id_vars=[choosers.index.name],
+                    var_name=alt_col_name,
+                    value_name="prob",
+                )
+                # probs are numbered 0..n-1 so we need to map back to alt ids
+                zone_map = pd.Series(alternatives.index).to_dict()
+                probs_df[alt_col_name] = probs_df[alt_col_name].map(zone_map)
+
+                survey_choices = pd.merge(
+                    survey_choices,
+                    probs_df,
+                    on=[choosers.index.name, alt_col_name],
+                    how="left",
+                )
+                survey_choices["rand"] = 0
+                survey_choices["prob"].fillna(0, inplace=True)
+                choices_df = pd.concat([choices_df, survey_choices], ignore_index=True)
+                choices_df.sort_values(by=[choosers.index.name], inplace=True)
 
         del probs
         chunk_sizer.log_df(trace_label, "probs", None)
