@@ -1083,6 +1083,10 @@ def choose_trip_destination(
 
     t0 = print_elapsed_time()
 
+    # use full index (including zero-size zones) to ensure stable random results
+    # fetch alts_context early so we don't worry about mutating alternatives first
+    alts_context = AltsContext.from_series(alternatives.index)
+
     # - trip_destination_sample
     destination_sample = trip_destination_sample(
         state,
@@ -1129,10 +1133,6 @@ def choose_trip_destination(
         destination_sample["dp_logsum"] = 0.0
 
     t0 = print_elapsed_time("%s.compute_logsums" % trace_label, t0, debug=True)
-    alt_dest_col_name = model_settings.ALT_DEST_COL_NAME
-    alts = alternatives.index
-    assert alts.name == alt_dest_col_name
-    alts_context = AltsContext.from_series(alts)
     destinations = trip_destination_simulate(
         state,
         primary_purpose=primary_purpose,

@@ -15,11 +15,11 @@ from activitysim.core.configuration.logit import (
     TourLocationComponentSettings,
     TourModeComponentSettings,
 )
+from activitysim.core.exceptions import DuplicateWorkflowTableError
 from activitysim.core.interaction_sample import interaction_sample
 from activitysim.core.interaction_sample_simulate import interaction_sample_simulate
 from activitysim.core.logit import AltsContext
 from activitysim.core.util import reindex
-from activitysim.core.exceptions import DuplicateWorkflowTableError
 
 """
 The school/workplace location model predicts the zones in which various people will
@@ -741,6 +741,7 @@ def run_location_choice(
     chunk_tag,
     trace_label,
     skip_choice=False,
+    alts_context: AltsContext | None = None,
 ):
     """
     Run the three-part location choice algorithm to generate a location choice for each chooser
@@ -760,6 +761,8 @@ def run_location_choice(
     model_settings : dict
     chunk_size : int
     trace_label : str
+    skip_choice : bool
+    alts_context : AltsContext or None
 
     Returns
     -------
@@ -792,11 +795,9 @@ def run_location_choice(
         if choosers.shape[0] == 0:
             logger.info(f"{trace_label} skipping segment {segment_name}: no choosers")
             continue
-        # using land use rather than size terms in case something goes 0 base -> nonzero project, double
-        # check if that would be in dest_size_terms as a zero
-        alts_context = AltsContext.from_series(dest_size_terms.index) # index zone_id, not ALT_DEST_COL_NAME
-        # assumes that dest_size_terms will always contain zeros for non-attractive zones, i.e. it will have the
-        # same length as land_use
+        # dest_size_terms contains 0-attraction zones so using this directly here, important for stable error terms
+        # when a zone goes from 0 base -> nonzero project
+        alts_context = AltsContext.from_series(dest_size_terms.index)
 
         # - location_sample
         location_sample_df = run_location_sample(
@@ -1044,6 +1045,17 @@ def iterate_location_choice(
                     persons_merged_df_.index.isin(spc.sampled_persons.index)
                 ]
                 persons_merged_df_ = persons_merged_df_.sort_index()
+
+        # reset rng offsets to identical state on each iteration. This ensures that the same set of random numbers is
+        # used on each iteration. Note this has to happen AFTER updating shadow prices because the simulation method
+        # draws random numbers.
+        # Only applying when using EET for now because this will need changes to integration
+        # tests, but it's probably a good idea for MC simulation as well.
+        if state.settings.use_explicit_error_terms and iteration > 1:
+            logger.debug(
+                f"{trace_label} resetting random number generator offsets for iteration {iteration}"
+            )
+            state.get_rn_generator().reset_offsets_for_step(state.current_model_name)
 
         choices_df_, save_sample_df = run_location_choice(
             state,
