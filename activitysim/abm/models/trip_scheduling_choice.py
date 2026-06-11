@@ -275,7 +275,10 @@ def run_trip_scheduling_choice(
             choosers,
             chunk_trace_label,
             chunk_sizer,
-        ) in chunk.adaptive_chunked_choosers(state, indirect_tours, trace_label):
+        ) in chunk.adaptive_chunked_choosers(
+            state, indirect_tours, trace_label,
+            explicit_chunk_size=model_settings.explicit_chunk
+        ):
             # Sort the choosers and get the schedule alternatives
             choosers = choosers.sort_index()
             schedules = generate_schedule_alternatives(choosers).sort_index()
@@ -343,6 +346,12 @@ class TripSchedulingChoiceSettings(PydanticReadable, extra="forbid"):
 
     SPECIFICATION: str
     """file name of specification file"""
+
+    explicit_chunk: float = 0
+    """
+    If > 0, use this chunk size instead of adaptive chunking.
+    If less than 1, use this fraction of the total number of rows.
+    """
 
     compute_settings: ComputeSettings = ComputeSettings()
     """Compute settings for this component."""
